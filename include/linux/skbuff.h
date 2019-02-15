@@ -232,6 +232,12 @@
 	SKB_WITH_OVERHEAD((PAGE_SIZE << (ORDER)) - (X))
 #define SKB_MAX_HEAD(X)		(SKB_MAX_ORDER((X), 0))
 #define SKB_MAX_ALLOC		(SKB_MAX_ORDER(0, 2))
+#ifdef CONFIG_SECURITY_TEMPESTA
+#define SKB_MAX_HEADER	(PAGE_SIZE - MAX_TCP_HEADER			\
+			 - SKB_DATA_ALIGN(sizeof(struct sk_buff))	\
+			 - SKB_DATA_ALIGN(sizeof(struct skb_shared_info)) \
+			 - SKB_DATA_ALIGN(1))
+#endif
 
 /* return minimum truesize of one skb containing X bytes of data */
 #define SKB_TRUESIZE(X) ((X) +						\
@@ -722,7 +728,11 @@ struct sk_buff {
 				peeked:1,
 				head_frag:1,
 				xmit_more:1,
+#ifdef CONFIG_SECURITY_TEMPESTA
+				skb_page:1;
+#else
 				__unused:1; /* one bit hole */
+#endif
 
 	/* fields enclosed in headers_start/headers_end are copied
 	 * using a single memcpy() in __copy_skb_header()
@@ -776,6 +786,9 @@ struct sk_buff {
 	__u8			tc_at_ingress:1;
 	__u8			tc_redirected:1;
 	__u8			tc_from_ingress:1;
+#endif
+#ifdef CONFIG_SECURITY_TEMPESTA
+	__u8			tail_lock:1;
 #endif
 
 #ifdef CONFIG_NET_SCHED
@@ -846,6 +859,50 @@ struct sk_buff {
 #define SKB_ALLOC_FCLONE	0x01
 #define SKB_ALLOC_RX		0x02
 #define SKB_ALLOC_NAPI		0x04
+
+#ifdef CONFIG_SECURITY_TEMPESTA
+/**
+ * The skb type is used only for time between @skb was inserted into TCP send
+ * queue and it's processed (first time) in tcp_write_xmit(). This time the @skb
+ * isn't scheduled yet, so we can use skb->dev for our needs to avoid extending
+ * sk_buff. We use the least significant bit to be sure that this isn't a
+ * pointer to not to break anything. TLS message type << 1 is always smaller
+ * than 0xff.
+ */
+static inline void
+tempesta_tls_skb_settype(struct sk_buff *skb, unsigned char type)
+{
+	BUG_ON(type >= 0x80);
+	WARN_ON_ONCE(skb->dev);
+
+	skb->dev = (void *)((type << 1) | 1UL);
+}
+
+static inline unsigned char
+tempesta_tls_skb_type(struct sk_buff *skb)
+{
+	unsigned long d = (unsigned long)skb->dev;
+
+	if (!(d & 1UL))
+		return 0; /* a pointer in skb->dev */
+	return d >> 1;
+}
+
+static inline void
+tempesta_tls_skb_typecp(struct sk_buff *dst, struct sk_buff *src)
+{
+	dst->dev = src->dev;
+}
+
+static inline void
+tempesta_tls_skb_clear(struct sk_buff *skb)
+{
+	unsigned long d = (unsigned long)skb->dev;
+
+	WARN_ON_ONCE(d & ~0xff);
+	skb->dev = NULL;
+}
+#endif
 
 /* Returns true if the skb was allocated from PFMEMALLOC reserves */
 static inline bool skb_pfmemalloc(const struct sk_buff *skb)
@@ -965,6 +1022,7 @@ void kfree_skb_partial(struct sk_buff *skb, bool head_stolen);
 bool skb_try_coalesce(struct sk_buff *to, struct sk_buff *from,
 		      bool *fragstolen, int *delta_truesize);
 
+void *pg_skb_alloc(unsigned int size, gfp_t gfp_mask, int node);
 struct sk_buff *__alloc_skb(unsigned int size, gfp_t priority, int flags,
 			    int node);
 struct sk_buff *__build_skb(void *data, unsigned int frag_size);
@@ -1885,7 +1943,11 @@ static inline struct sk_buff *__skb_dequeue_tail(struct sk_buff_head *list)
 
 static inline bool skb_is_nonlinear(const struct sk_buff *skb)
 {
+#ifdef CONFIG_SECURITY_TEMPESTA
+	return skb->tail_lock || skb->data_len;
+#else
 	return skb->data_len;
+#endif
 }
 
 static inline unsigned int skb_headlen(const struct sk_buff *skb)
@@ -2123,6 +2185,20 @@ static inline unsigned int skb_headroom(const struct sk_buff *skb)
 {
 	return skb->data - skb->head;
 }
+
+#ifdef CONFIG_SECURITY_TEMPESTA
+/**
+ *	skb_tailroom_locked - bytes at buffer end
+ *	@skb: buffer to check
+ *
+ *	Return the number of bytes of free space at the tail of an sk_buff with
+ *	respect to tail locking only.
+ */
+static inline int skb_tailroom_locked(const struct sk_buff *skb)
+{
+	return skb->tail_lock ? 0 : skb->end - skb->tail;
+}
+#endif
 
 /**
  *	skb_tailroom - bytes at buffer end

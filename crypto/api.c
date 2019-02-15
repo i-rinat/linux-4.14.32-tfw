@@ -451,7 +451,11 @@ void *crypto_create_tfm(struct crypto_alg *alg,
 	tfmsize = frontend->tfmsize;
 	total = tfmsize + sizeof(*tfm) + frontend->extsize(alg);
 
+#ifdef CONFIG_SECURITY_TEMPESTA
+	mem = kzalloc(total, GFP_ATOMIC);
+#else
 	mem = kzalloc(total, GFP_KERNEL);
+#endif
 	if (mem == NULL)
 		goto out_err;
 
@@ -486,6 +490,9 @@ struct crypto_alg *crypto_find_alg(const char *alg_name,
 {
 	struct crypto_alg *(*lookup)(const char *name, u32 type, u32 mask) =
 		crypto_alg_mod_lookup;
+
+	/* The function is slow and preemptable to be called in softirq. */
+	WARN_ON_ONCE(in_serving_softirq());
 
 	if (frontend) {
 		type &= frontend->maskclear;

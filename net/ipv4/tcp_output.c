@@ -37,6 +37,9 @@
 #define pr_fmt(fmt) "TCP: " fmt
 
 #include <net/tcp.h>
+#ifdef CONFIG_SECURITY_TEMPESTA
+#include <net/tls.h>
+#endif
 
 #include <linux/compiler.h>
 #include <linux/gfp.h>
@@ -392,7 +395,7 @@ static void tcp_ecn_send(struct sock *sk, struct sk_buff *skb,
 /* Constructs common control bits of non-data skb. If SYN/FIN is present,
  * auto increment end seqno.
  */
-static void tcp_init_nondata_skb(struct sk_buff *skb, u32 seq, u8 flags)
+void tcp_init_nondata_skb(struct sk_buff *skb, u32 seq, u8 flags)
 {
 	skb->ip_summed = CHECKSUM_PARTIAL;
 	skb->csum = 0;
@@ -407,6 +410,7 @@ static void tcp_init_nondata_skb(struct sk_buff *skb, u32 seq, u8 flags)
 		seq++;
 	TCP_SKB_CB(skb)->end_seq = seq;
 }
+EXPORT_SYMBOL(tcp_init_nondata_skb);
 
 static inline bool tcp_urg_mode(const struct tcp_sock *tp)
 {
@@ -1140,7 +1144,7 @@ static int tcp_transmit_skb(struct sock *sk, struct sk_buff *skb, int clone_it,
  * NOTE: probe0 timer is not checked, do not forget tcp_push_pending_frames,
  * otherwise socket can stall.
  */
-static void tcp_queue_skb(struct sock *sk, struct sk_buff *skb)
+void tcp_queue_skb(struct sock *sk, struct sk_buff *skb)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 
@@ -1151,6 +1155,7 @@ static void tcp_queue_skb(struct sock *sk, struct sk_buff *skb)
 	sk->sk_wmem_queued += skb->truesize;
 	sk_mem_charge(sk, skb->truesize);
 }
+EXPORT_SYMBOL(tcp_queue_skb);
 
 /* Initialize TSO segments for a packet. */
 static void tcp_set_skb_tso_segs(struct sk_buff *skb, unsigned int mss_now)
@@ -1241,6 +1246,32 @@ static void tcp_skb_fragment_eor(struct sk_buff *skb, struct sk_buff *skb2)
 	TCP_SKB_CB(skb)->eor = 0;
 }
 
+/**
+ * Tempesta uses page fragments for all skb allocations, so if an skb was
+ * allocated in standard Linux way, then pskb_expand_head( , 0, 0, ) may
+ * return larger skb and we have to adjust skb->truesize and memory accounting
+ * for TCP write queue.
+ */
+static int
+tcp_skb_unclone(struct sock *sk, struct sk_buff *skb, gfp_t pri)
+{
+	int r, delta_truesize = skb->truesize;
+
+	if ((r = skb_unclone(skb, pri)))
+		return r;
+
+	delta_truesize -= skb->truesize;
+	sk->sk_wmem_queued -= delta_truesize;
+	if (delta_truesize > 0) {
+		sk_mem_uncharge(sk, delta_truesize);
+		sock_set_flag(sk, SOCK_QUEUE_SHRUNK);
+	} else {
+		sk_mem_charge(sk, -delta_truesize);
+	}
+
+	return 0;
+}
+
 /* Function to create two new TCP segments.  Shrinks the given segment
  * to the specified size and appends a new segment with the rest of the
  * packet to the list.  This won't be called frequently, I hope.
@@ -1262,7 +1293,7 @@ int tcp_fragment(struct sock *sk, struct sk_buff *skb, u32 len,
 	if (nsize < 0)
 		nsize = 0;
 
-	if (skb_unclone(skb, gfp))
+	if (tcp_skb_unclone(sk, skb, gfp))
 		return -ENOMEM;
 
 	/* Get a new skb... force flag on. */
@@ -1380,7 +1411,7 @@ int tcp_trim_head(struct sock *sk, struct sk_buff *skb, u32 len)
 {
 	u32 delta_truesize;
 
-	if (skb_unclone(skb, GFP_ATOMIC))
+	if (tcp_skb_unclone(sk, skb, GFP_ATOMIC))
 		return -ENOMEM;
 
 	delta_truesize = __pskb_trim_head(skb, len);
@@ -1560,6 +1591,7 @@ unsigned int tcp_current_mss(struct sock *sk)
 
 	return mss_now;
 }
+EXPORT_SYMBOL(tcp_current_mss);
 
 /* RFC2861, slow part. Adjust cwnd, after it was not full during one rto.
  * As additional protections, we do not touch cwnd in retransmission phases,
@@ -2327,7 +2359,20 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 							  cwnd_quota,
 							  max_segs),
 						    nonagle);
-
+#ifdef CONFIG_SECURITY_TEMPESTA
+		if (sk->sk_write_xmit && tempesta_tls_skb_type(skb)) {
+			if (unlikely(limit <= TLS_MAX_OVERHEAD)) {
+				net_warn_ratelimited("%s: too small MSS %u"
+						     " for TLS\n",
+						     __func__, mss_now);
+				break;
+			}
+			if (limit > TLS_MAX_PAYLOAD_SIZE + TLS_MAX_OVERHEAD)
+				limit = TLS_MAX_PAYLOAD_SIZE;
+			else
+				limit -= TLS_MAX_OVERHEAD;
+		}
+#endif
 		if (skb->len > limit &&
 		    unlikely(tso_fragment(sk, skb, limit, mss_now, gfp)))
 			break;
@@ -2336,7 +2381,32 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 			clear_bit(TCP_TSQ_DEFERRED, &sk->sk_tsq_flags);
 		if (tcp_small_queue_check(sk, skb, 0))
 			break;
-
+#ifdef CONFIG_SECURITY_TEMPESTA
+		/*
+		 * This isn't the only place where tcp_transmit_skb() is called,
+		 * but this is the only place where we are from Tempesta FW
+		 * ss_do_send(), so call the hook here. At this point, with
+		 * @limit adjusted above, we have exact understanding how much
+		 * data we can and should send to the peer, so we call
+		 * encryption here and get the best TLS record size.
+		 *
+		 * TODO Sometimes HTTP servers send headers and response body in
+		 * different TCP segments, so coalesce skbs for transmission to
+		 * get 16KB (maximum size of TLS message).
+		 */
+		if (sk->sk_write_xmit && tempesta_tls_skb_type(skb)) {
+			result = sk->sk_write_xmit(sk, skb, limit);
+			if (unlikely(result)) {
+				net_warn_ratelimited(
+					"Tempesta: cannot encrypt data (%d),"
+					" reset a TLS connection.\n", result);
+				tcp_reset(sk);
+				break;
+			}
+			/* Fix up TSO segments after TLS overhead. */
+			tcp_set_skb_tso_segs(skb, mss_now);
+		}
+#endif
 		if (unlikely(tcp_transmit_skb(sk, skb, 1, gfp)))
 			break;
 
@@ -2518,6 +2588,7 @@ void __tcp_push_pending_frames(struct sock *sk, unsigned int cur_mss,
 			   sk_gfp_mask(sk, GFP_ATOMIC)))
 		tcp_check_probe_timer(sk);
 }
+EXPORT_SYMBOL(__tcp_push_pending_frames);
 
 /* Send _single_ skb sitting at the send head. This function requires
  * true push pending frames to setup probe timer etc.
@@ -2839,7 +2910,7 @@ int __tcp_retransmit_skb(struct sock *sk, struct sk_buff *skb, int segs)
 		if (tcp_fragment(sk, skb, len, cur_mss, GFP_ATOMIC))
 			return -ENOMEM; /* We'll try again later. */
 	} else {
-		if (skb_unclone(skb, GFP_ATOMIC))
+		if (tcp_skb_unclone(sk, skb, GFP_ATOMIC))
 			return -ENOMEM;
 
 		diff = tcp_skb_pcount(skb);
@@ -3129,6 +3200,7 @@ int tcp_send_synack(struct sock *sk)
 	}
 	return tcp_transmit_skb(sk, skb, 1, GFP_ATOMIC);
 }
+EXPORT_SYMBOL(tcp_send_active_reset);
 
 /**
  * tcp_make_synack - Prepare a SYN-ACK.
